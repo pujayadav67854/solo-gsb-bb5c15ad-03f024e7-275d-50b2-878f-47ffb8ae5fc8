@@ -16,11 +16,13 @@ from .database import connect, init_db
 from .engine import (
     CompiledRuleset,
     EvaluationFailed,
+    FootprintAnalysisError,
     ImpactAnalysisError,
     RulesetCompileError,
     compile_ruleset,
     evaluate,
     impact_analysis,
+    input_footprint,
 )
 from .schemas import (
     BatchEvaluationOut,
@@ -29,6 +31,8 @@ from .schemas import (
     EvaluateRequest,
     EvaluationOut,
     EvaluationStatsOut,
+    FootprintOut,
+    FootprintRequest,
     ImpactOut,
     ImpactRequest,
     RecomputeRequest,
@@ -317,6 +321,42 @@ def ruleset_impact(
     try:
         result = impact_analysis(compiled, req.rule_codes)
     except ImpactAnalysisError as exc:
+        return _error(exc.code, exc.message, 422, details=exc.details)
+
+    return {"ruleset_id": ruleset_id, "version": req.version, **result}
+
+
+# ---------- 静态输入足迹分析 ----------
+
+
+@app.post(
+    "/api/rulesets/{ruleset_id}/input-footprint",
+    response_model=FootprintOut,
+    tags=["rulesets"],
+    responses={404: {"model": ErrorResponse}, 422: {"model": ErrorResponse}},
+)
+def ruleset_input_footprint(
+    ruleset_id: str,
+    req: FootprintRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> Any:
+    """静态汇总目标规则及其上游依赖读取的文档路径：不求值、不写库。
+
+    仅接受以 doc 为根、每级下标为字符串/非负整数常量的访问链，并按
+    RFC 6901 转义为 JSON Pointer；发现动态下标返回
+    422 UNSUPPORTED_DOCUMENT_ACCESS（不给部分结果）。未知规则沿用
+    impact 的 422 RULE_NOT_FOUND。
+    """
+    if crud.get_ruleset(conn, ruleset_id) is None:
+        return _error("NOT_FOUND", f"规则集不存在：{ruleset_id}", 404)
+    try:
+        _snapshot, compiled = _load_compiled(conn, ruleset_id, req.version)
+    except LookupError:
+        return _error("VERSION_NOT_FOUND", f"版本 {req.version} 不存在", 404)
+
+    try:
+        result = input_footprint(compiled, req.rule_codes)
+    except FootprintAnalysisError as exc:
         return _error(exc.code, exc.message, 422, details=exc.details)
 
     return {"ruleset_id": ruleset_id, "version": req.version, **result}

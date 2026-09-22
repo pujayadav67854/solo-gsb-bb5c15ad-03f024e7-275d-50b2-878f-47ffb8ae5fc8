@@ -20,7 +20,9 @@
 │   ├── engine/
 │   │   ├── ast_eval.py    # 基于 AST 的安全表达式求值（沙箱）
 │   │   ├── compiler.py    # 规则编译：引用、依赖、循环、冲突策略校验
-│   │   └── evaluator.py   # 拓扑排序 + 定点迭代 + 冲突处理
+│   │   ├── evaluator.py   # 拓扑排序 + 定点迭代 + 冲突处理
+│   │   ├── impact.py      # 静态影响分析：反向依赖闭包 + 冲突组联动
+│   │   └── footprint.py   # 静态输入足迹：doc 访问链 → RFC 6901 JSON Pointer
 │   └── seed.py            # 演示规则集初始化
 ├── tests/                 # pytest 单元/接口测试
 ├── Dockerfile
@@ -180,6 +182,7 @@ SEED_DEMO=1 uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET`  | `/api/rulesets/{id}/versions` | 列出全部版本 |
 | `GET`  | `/api/rulesets/{id}/versions/{version}` | 获取指定版本快照 |
 | `POST` | `/api/rulesets/{id}/impact` | 静态依赖影响分析（不求值、不落库） |
+| `POST` | `/api/rulesets/{id}/input-footprint` | 静态输入足迹：汇总规则及上游读取的文档路径（不求值、不落库） |
 | `PUT`  | `/api/rulesets/{id}` | 修改规则集 → 生成新版本并自动重算 |
 | `POST` | `/api/rulesets/{id}/evaluate` | 用最新版（或 `?version=n` 指定旧版）决策，默认持久化结果 |
 | `POST` | `/api/rulesets/{id}/evaluate-batch` | 批量决策（≤100 项），整批固定同一版本，逐项隔离错误 |
@@ -431,6 +434,92 @@ curl -s -X POST localhost:8000/api/rulesets/demo-promotions/impact \
 `["vip_discount", "free_shipping"]` 与传递依赖方 `["manual_review"]`，
 而 discount 组双方都已在闭包内，不再产生联动项。
 
+### 静态输入足迹分析
+
+`POST /api/rulesets/{id}/input-footprint` 用于在**提交文档前**静态回答
+“这些规则运行时会读取文档的哪些字段”：对每个目标规则，汇总**规则自身
+及其全部上游依赖规则**（沿 `depends_on` 与表达式规则引用展开）在
+`condition` / `action` 中读取的文档路径。分析过程**不执行任何文档求值
+（不调用表达式求值器、不发生短路裁剪），也不写入 evaluations**——三元
+表达式的两个分支、`and/or` 两侧等实际未必执行的读取都会保守计入。
+
+请求体与 `/impact` 相同：
+
+| 字段 | 说明 |
+| --- | --- |
+| `version` | **必填**，分析所基于的规则版本（不可变快照） |
+| `rule_codes` | 一个或多个目标规则编码（至少 1 个；重复编码去重保序） |
+
+路径识别规则：
+
+- 只接受**以 `doc` 为根的访问链**，每一级下标必须是**字符串或非负整数
+  常量**（`doc["amount"]`、`doc["items"][0]`、`doc["a~b/c"]`）；字典点
+  访问 `doc.amount` 在求值期等价于 `doc["amount"]`，同样接受；
+- 收集**完整访问链**（叶子字段）：`doc["customer"]["vip"]` 的路径是
+  `/customer/vip`，中间节点 `doc["customer"]` 不单独列出；方法调用在方法
+  名之前终止（`doc["name"].upper()` 的路径是 `/name`）；单独出现的裸
+  `doc`（如 `len(doc)`）记为 `""`，即整个文档；
+- 每个常量下标按 **RFC 6901** 转义为 JSON Pointer：`~` → `~0`、
+  `/` → `~1`；非负整数按十进制原样作为引用词（`doc[0]` → `/0`）；
+- **任何一级下标是动态/不支持形式**——名字或表达式（`doc[k]`、
+  `doc["k" + "x"]`）、负下标（`doc[-1]`）、切片（`doc[1:3]`）、
+  布尔/浮点/`None`、元组下标等——无法静态确定读取位置，请求**整体返回
+  422 `UNSUPPORTED_DOCUMENT_ACCESS`，不会给出部分结果**；
+- 不以 `doc` 为根的下标（如规则结果 `r1.value[0]`）不属于文档读取，
+  既不报错也不计入。
+
+响应中每个目标返回：
+
+- `paths`：目标及其上游读取路径去重后的列表，**按 JSON Pointer 字典序**；
+- 每条路径的 `used_by`：闭包内实际读取该路径的规则编码，按该版本的
+  **`evaluation_order`** 排列去重。
+
+错误情况与 `/impact` 一致：规则集不存在 → 404 `NOT_FOUND`；版本不存在 →
+404 `VERSION_NOT_FOUND`；规则编码在该版本中不存在 → 422 `RULE_NOT_FOUND`
+（`details.rule_codes` 列出全部缺失编码）；请求体缺字段、`version<1`、
+`rule_codes` 为空 → 422。
+
+请求示例：
+
+```bash
+curl -s -X POST localhost:8000/api/rulesets/demo-promotions/input-footprint \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 1, "rule_codes": ["manual_review"]}' | python3 -m json.tool
+```
+
+响应示例（`manual_review` 依赖 `vip_discount`，后者又依赖 `is_vip`；
+`/amount` 同时被 `vip_discount` 与 `manual_review` 读取）：
+
+```json
+{
+  "ruleset_id": "demo-promotions",
+  "version": 1,
+  "rule_codes": ["manual_review"],
+  "footprints": [
+    {
+      "rule_code": "manual_review",
+      "paths": [
+        {"path": "/amount", "used_by": ["vip_discount", "manual_review"]},
+        {"path": "/customer/vip", "used_by": ["is_vip"]}
+      ]
+    }
+  ]
+}
+```
+
+动态下标导致整体失败的示例：
+
+```bash
+curl -i -X POST localhost:8000/api/rulesets/r/input-footprint \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 1, "rule_codes": ["r1"]}'
+# HTTP/1.1 422 Unprocessable Entity
+# {"error": {"code": "UNSUPPORTED_DOCUMENT_ACCESS",
+#   "message": "规则 r1 的 condition 表达式包含无法静态确定的文档下标：doc[...\"k\" + \"x\"...]",
+#   "details": {"rule_code": "r1", "part": "condition",
+#               "index": "\"k\" + \"x\"", "expression": "doc[\"k\" + \"x\"] == 1"}}}
+```
+
 ## 测试
 
 ```bash
@@ -440,5 +529,6 @@ pytest -q
 
 测试覆盖：AST 沙箱安全性、编译校验（重复编码/未知依赖/隐式引用/循环/冲突策略冲突）、
 拓扑排序、定点迭代、三种冲突策略、版本化重算、评估统计聚合（筛选/排序/零值/非法参数）、
-静态影响分析（反向闭包/层级/多输入去重/冲突组联动/404 与 422），
+静态影响分析（反向闭包/层级/多输入去重/冲突组联动/404 与 422）、
+静态输入足迹（doc 访问链提取/RFC 6901 转义/上游闭包 used_by/动态下标 422/404 与 422），
 以及完整 HTTP 接口。

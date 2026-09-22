@@ -15,6 +15,7 @@ from .compiler import (
     topo_order,
 )
 from .evaluator import EvaluationFailed, evaluate
+from .footprint import FootprintAnalysisError, input_footprint
 from .impact import ImpactAnalysisError, impact_analysis, reverse_dependencies
 
 __all__ = [
@@ -30,6 +31,8 @@ __all__ = [
     "topo_order",
     "EvaluationFailed",
     "evaluate",
+    "FootprintAnalysisError",
+    "input_footprint",
     "ImpactAnalysisError",
     "impact_analysis",
     "reverse_dependencies",
