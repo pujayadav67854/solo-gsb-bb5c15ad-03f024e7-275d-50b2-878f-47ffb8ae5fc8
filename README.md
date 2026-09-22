@@ -20,7 +20,9 @@
 │   ├── engine/
 │   │   ├── ast_eval.py    # 基于 AST 的安全表达式求值（沙箱）
 │   │   ├── compiler.py    # 规则编译：引用、依赖、循环、冲突策略校验
-│   │   └── evaluator.py   # 拓扑排序 + 定点迭代 + 冲突处理
+│   │   ├── evaluator.py   # 拓扑排序 + 定点迭代 + 冲突处理
+│   │   ├── impact.py      # 静态影响分析：反向依赖闭包 + 冲突组联动
+│   │   └── footprint.py   # 静态输入足迹：doc 访问链提取（RFC 6901）
 │   └── seed.py            # 演示规则集初始化
 ├── tests/                 # pytest 单元/接口测试
 ├── Dockerfile
@@ -180,6 +182,7 @@ SEED_DEMO=1 uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET`  | `/api/rulesets/{id}/versions` | 列出全部版本 |
 | `GET`  | `/api/rulesets/{id}/versions/{version}` | 获取指定版本快照 |
 | `POST` | `/api/rulesets/{id}/impact` | 静态依赖影响分析（不求值、不落库） |
+| `POST` | `/api/rulesets/{id}/input-footprint` | 静态汇总目标规则及上游依赖读取的文档路径（不求值、不落库） |
 | `PUT`  | `/api/rulesets/{id}` | 修改规则集 → 生成新版本并自动重算 |
 | `POST` | `/api/rulesets/{id}/evaluate` | 用最新版（或 `?version=n` 指定旧版）决策，默认持久化结果 |
 | `POST` | `/api/rulesets/{id}/evaluate-batch` | 批量决策（≤100 项），整批固定同一版本，逐项隔离错误 |
@@ -431,6 +434,89 @@ curl -s -X POST localhost:8000/api/rulesets/demo-promotions/impact \
 `["vip_discount", "free_shipping"]` 与传递依赖方 `["manual_review"]`，
 而 discount 组双方都已在闭包内，不再产生联动项。
 
+### 静态输入足迹分析
+
+`POST /api/rulesets/{id}/input-footprint` 用于在**改动规则前评估输入面**：
+提交必填的 `version` 与非空 `rule_codes`，服务基于该版本快照**静态**汇总
+每个目标规则自身及其**全部上游依赖规则**（`depends_on` 传递闭包）在
+`condition`、`action` 表达式中读取的文档路径——**不执行任何文档求值，也
+不会写入 evaluations**。
+
+文档访问链约束：
+
+- 只接受以 `doc` 为根、且**每级下标均为字符串或非负整数常量**的访问链，
+  例如 `doc["customer"]["vip"]`、`doc["items"][0]`；字典点访问
+  `doc.amount` 与 `doc["amount"]` 等价，同样支持；
+- 路径按 **RFC 6901** 转义为 JSON Pointer（分段符 `/` 前置、`~` → `~0`、
+  `/` → `~1`），例如 `doc["a/b"]["x~y"]` → `/a~1b/x~0y`，数字下标
+  原样转十进制文本（`[0]` → `/0`）；
+- 只上报**最长链**：`doc["customer"]["vip"]` 只产生 `/customer/vip`；
+  若 `doc["x"]` 在表达式中另有独立使用（如 `doc["x"] + doc["x"]["y"]`），
+  则 `/x` 与 `/x/y` 都会出现；裸 `doc`（如 `len(doc)`、动作整体返回
+  `doc`）对应空串，表示读取整个文档；
+- **发现动态下标**（变量、运算结果、负整数、切片、布尔/浮点等非常量键，
+  包括出现在上游依赖规则表达式中的）一律整体返回
+  **422 `UNSUPPORTED_DOCUMENT_ACCESS`**，绝不给出不完整结果。
+
+响应中每个目标规则返回 `paths`：
+
+- `path`：去重后的 JSON Pointer，按**路径字典序**排列；
+- `used_by`：目标自身及其上游闭包中实际读取该路径的规则编码，按该版本的
+  **`evaluation_order`** 排列；
+- 闭包内没有任何文档读取的规则（如只依赖其他规则命中结果的规则）返回
+  空的 `paths`。
+
+错误情况：
+
+- 规则集不存在 → **404** `NOT_FOUND`；
+- 版本不存在 → **404** `VERSION_NOT_FOUND`；
+- 规则编码在该版本中不存在 → **422** `RULE_NOT_FOUND`
+  （`details.rule_codes` 列出全部缺失编码，与 `/impact` 一致）；
+- 存在不支持的文档访问 → **422** `UNSUPPORTED_DOCUMENT_ACCESS`
+  （`details` 含 `rule_code` / `expression`（`condition` 或 `action`）/
+  `access`（不支持的下标源码文本））；
+- 请求体缺字段、`version<1`、`rule_codes` 为空 → **422**。
+
+请求示例（演示规则集 v1 中，`manual_review` 依赖 `vip_discount`，后者
+依赖 `is_vip`）：
+
+```bash
+curl -s -X POST localhost:8000/api/rulesets/demo-promotions/input-footprint \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 1, "rule_codes": ["manual_review"]}' | python3 -m json.tool
+```
+
+响应示例：
+
+```json
+{
+  "ruleset_id": "demo-promotions",
+  "version": 1,
+  "rule_codes": ["manual_review"],
+  "footprints": [
+    {
+      "rule_code": "manual_review",
+      "paths": [
+        {"path": "/amount", "used_by": ["vip_discount", "manual_review"]},
+        {"path": "/customer/vip", "used_by": ["is_vip"]}
+      ]
+    }
+  ]
+}
+```
+
+动态下标导致整体失败的示例（规则 `r` 的条件为 `doc["items"][-1] == 1`）：
+
+```json
+{
+  "error": {
+    "code": "UNSUPPORTED_DOCUMENT_ACCESS",
+    "message": "规则 r 的条件表达式中存在不支持的文档访问：下标 '-1' 不是字符串或非负整数常量",
+    "details": {"rule_code": "r", "expression": "condition", "access": "-1"}
+  }
+}
+```
+
 ## 测试
 
 ```bash
@@ -440,5 +526,6 @@ pytest -q
 
 测试覆盖：AST 沙箱安全性、编译校验（重复编码/未知依赖/隐式引用/循环/冲突策略冲突）、
 拓扑排序、定点迭代、三种冲突策略、版本化重算、评估统计聚合（筛选/排序/零值/非法参数）、
-静态影响分析（反向闭包/层级/多输入去重/冲突组联动/404 与 422），
+静态影响分析（反向闭包/层级/多输入去重/冲突组联动/404 与 422）、
+静态输入足迹（上游闭包/最长链/整数下标/RFC 6901 转义/动态下标整体 422/404 与 422），
 以及完整 HTTP 接口。

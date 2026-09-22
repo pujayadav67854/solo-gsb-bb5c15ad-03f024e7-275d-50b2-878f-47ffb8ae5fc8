@@ -205,6 +205,49 @@ class ImpactOut(BaseModel):
     )
 
 
+class InputFootprintRequest(BaseModel):
+    version: int = Field(
+        ..., ge=1, description="分析所基于的规则版本（必填，不可变快照）"
+    )
+    rule_codes: list[str] = Field(
+        ...,
+        min_length=1,
+        description="一个或多个待分析的目标规则编码",
+    )
+
+
+class InputFootprintPathOut(BaseModel):
+    path: str = Field(
+        ...,
+        description="RFC 6901 JSON Pointer，以 / 分段；空串表示整个文档",
+    )
+    used_by: list[str] = Field(
+        ...,
+        description=(
+            "目标规则及其上游依赖闭包中实际读取该路径的规则编码，"
+            "按 evaluation_order 排列"
+        ),
+    )
+
+
+class InputFootprintItemOut(BaseModel):
+    rule_code: str = Field(..., description="目标规则编码")
+    paths: list[InputFootprintPathOut] = Field(
+        ..., description="去重后的文档读取路径，按路径字典序排列"
+    )
+
+
+class InputFootprintOut(BaseModel):
+    ruleset_id: str
+    version: int = Field(..., description="实际分析的规则版本")
+    rule_codes: list[str] = Field(
+        ..., description="去重保序后的输入规则编码回显"
+    )
+    footprints: list[InputFootprintItemOut] = Field(
+        ..., description="与输入同序的每个目标规则的输入足迹"
+    )
+
+
 class RuleStatOut(BaseModel):
     code: str = Field(..., description="规则编码")
     hit_count: int = Field(..., description="traces 中 hit=true 的决策条数")

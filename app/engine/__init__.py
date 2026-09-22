@@ -15,6 +15,12 @@ from .compiler import (
     topo_order,
 )
 from .evaluator import EvaluationFailed, evaluate
+from .footprint import (
+    FootprintAnalysisError,
+    extract_doc_paths,
+    input_footprint,
+    to_json_pointer,
+)
 from .impact import ImpactAnalysisError, impact_analysis, reverse_dependencies
 
 __all__ = [
@@ -33,4 +39,8 @@ __all__ = [
     "ImpactAnalysisError",
     "impact_analysis",
     "reverse_dependencies",
+    "FootprintAnalysisError",
+    "input_footprint",
+    "extract_doc_paths",
+    "to_json_pointer",
 ]
